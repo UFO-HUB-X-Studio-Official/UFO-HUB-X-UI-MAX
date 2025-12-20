@@ -1,4 +1,4 @@
--- UFO • Position Saver UI (Standalone) v3 - FIX "not showing"
+-- UFO • Position Saver UI (Standalone) v4 - PIVOT ANCHOR + Copy Numbers
 do
     local Players = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
@@ -16,19 +16,22 @@ do
         end)
     end
 
+    local function trySetClipboard(text)
+        if setclipboard then
+            local ok = pcall(function() setclipboard(tostring(text)) end)
+            return ok
+        end
+        return false
+    end
+
     -- ===== choose parent safely =====
     local function getBestGuiParent()
-        -- 1) executor UI container (if exists)
         if typeof(gethui) == "function" then
             local ok, hui = pcall(gethui)
             if ok and hui then return hui, "gethui()" end
         end
-
-        -- 2) CoreGui (sometimes blocked)
         local core = game:GetService("CoreGui")
         if core then return core, "CoreGui" end
-
-        -- 3) PlayerGui fallback
         local pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
         return pg, "PlayerGui"
     end
@@ -69,16 +72,16 @@ do
         local ch = getChar()
         params.FilterDescendantsInstances = ch and { ch } or {}
         params.IgnoreWater = true
-        return Workspace:Raycast(fromPos, Vector3.new(0, -250, 0), params)
+        return Workspace:Raycast(fromPos, Vector3.new(0, -350, 0), params)
     end
 
-    local function getStandingAnchor()
+    local function getStandingPart()
         local hrp = getHRP()
         if not hrp then return nil end
         local r = raycastDown(hrp.Position)
-        if not r or not r.Instance then return nil end
-        local inst = r.Instance
-        if inst:IsA("BasePart") then return inst end
+        if r and r.Instance and r.Instance:IsA("BasePart") then
+            return r.Instance
+        end
         return nil
     end
 
@@ -89,39 +92,61 @@ do
         return math.sqrt(dx*dx + dy*dy + dz*dz)
     end
 
-    local function findAnchorInCurrentMap(anchorName, preferPos, modelNameHint)
-        local best, bestD = nil, math.huge
-        preferPos = preferPos or (getHRP() and getHRP().Position) or Vector3.new(0,0,0)
+    -- ===== Pivot Anchor logic =====
+    local function getModelPivot(m)
+        local ok, pv = pcall(function() return m:GetPivot() end)
+        if ok and typeof(pv) == "CFrame" then return pv end
+        return nil
+    end
 
+    local function pickBestAnchorModel()
+        local hrp = getHRP()
+        if not hrp then return nil end
+
+        local under = getStandingPart()
+        if not under then return nil end
+
+        -- Prefer nearest ancestor Model
+        local model = under:FindFirstAncestorOfClass("Model")
+        if model and getModelPivot(model) then
+            return model
+        end
+
+        -- Fallback: find any model nearby by pivot
+        local best, bestD = nil, math.huge
+        local p = hrp.Position
         for _, d in ipairs(Workspace:GetDescendants()) do
-            if d:IsA("BasePart") and d.Name == anchorName then
-                if modelNameHint and modelNameHint ~= "" then
-                    local m = d:FindFirstAncestorOfClass("Model")
-                    if m and m.Name ~= modelNameHint then
-                        local dd = dist(d.Position, preferPos) + 999
-                        if dd < bestD then bestD = dd; best = d end
-                        continue
+            if d:IsA("Model") then
+                local pv = getModelPivot(d)
+                if pv then
+                    local dd = dist(pv.Position, p)
+                    if dd < bestD then
+                        bestD = dd
+                        best = d
                     end
                 end
-                local dd = dist(d.Position, preferPos)
-                if dd < bestD then bestD = dd; best = d end
             end
         end
         return best
     end
 
-    -- ===== stored state =====
-    local state = {
-        hasData = false,
-        anchorName = "",
-        modelNameHint = "",
-        relative = nil,
-        builtScript = "",
-    }
+    local function findModelByNameNearest(name, preferPos)
+        local best, bestD = nil, math.huge
+        preferPos = preferPos or (getHRP() and getHRP().Position) or Vector3.new(0,0,0)
 
-    local function fmt3(n)
-        n = tonumber(n) or 0
-        return string.format("%.3f", n)
+        for _, d in ipairs(Workspace:GetDescendants()) do
+            if d:IsA("Model") and d.Name == name then
+                local pv = getModelPivot(d)
+                if pv then
+                    local dd = dist(pv.Position, preferPos)
+                    if dd < bestD then
+                        bestD = dd
+                        best = d
+                    end
+                end
+            end
+        end
+        return best
     end
 
     local function cframeToLua(cf)
@@ -131,20 +156,27 @@ do
         return ("CFrame.new(%s)"):format(table.concat(out, ","))
     end
 
+    -- ===== stored state =====
+    local state = {
+        hasData = false,
+        anchorModelName = "",
+        relative = nil,
+        builtScript = "",
+    }
+
     local function buildScriptFromState()
         if not state.hasData or not state.relative then return "" end
         local rel = cframeToLua(state.relative)
 
-        local scriptText = ([[
--- Position Warp Script (Relative to Anchor)
+        return ([[
+-- Position Warp Script (Relative to Model Pivot)
 do
     local Players = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
     local LP = Players.LocalPlayer
 
-    local ANCHOR_NAME = %q
-    local MODEL_HINT  = %q
-    local RELATIVE    = %s
+    local ANCHOR_MODEL_NAME = %q
+    local RELATIVE = %s
 
     local function getHRP()
         local ch = LP.Character
@@ -158,22 +190,22 @@ do
         return math.sqrt(dx*dx + dy*dy + dz*dz)
     end
 
-    local function findAnchor(preferPos)
+    local function getPivot(m)
+        local ok, pv = pcall(function() return m:GetPivot() end)
+        if ok and typeof(pv) == "CFrame" then return pv end
+        return nil
+    end
+
+    local function findModelNearest(name, preferPos)
         local best, bestD = nil, math.huge
         preferPos = preferPos or Vector3.new(0,0,0)
-
         for _, d in ipairs(Workspace:GetDescendants()) do
-            if d:IsA("BasePart") and d.Name == ANCHOR_NAME then
-                if MODEL_HINT and MODEL_HINT ~= "" then
-                    local m = d:FindFirstAncestorOfClass("Model")
-                    if m and m.Name ~= MODEL_HINT then
-                        local dd = dist(d.Position, preferPos) + 999
-                        if dd < bestD then bestD = dd; best = d end
-                        continue
-                    end
+            if d:IsA("Model") and d.Name == name then
+                local pv = getPivot(d)
+                if pv then
+                    local dd = dist(pv.Position, preferPos)
+                    if dd < bestD then bestD = dd; best = d end
                 end
-                local dd = dist(d.Position, preferPos)
-                if dd < bestD then bestD = dd; best = d end
             end
         end
         return best
@@ -182,35 +214,43 @@ do
     local function warp()
         local hrp = getHRP()
         if not hrp then return end
-        local anchor = findAnchor(hrp.Position)
-        if not anchor then
-            warn("[PositionWarp] Anchor not found:", ANCHOR_NAME)
+        local m = findModelNearest(ANCHOR_MODEL_NAME, hrp.Position)
+        if not m then
+            warn("[PositionWarp] Model not found:", ANCHOR_MODEL_NAME)
             return
         end
-        hrp.CFrame = anchor.CFrame:ToWorldSpace(RELATIVE)
+        local pv = getPivot(m)
+        if not pv then return end
+        hrp.CFrame = pv:ToWorldSpace(RELATIVE)
     end
 
     warp()
 end
-]]):format(state.anchorName, state.modelNameHint, rel)
-
-        return scriptText
+]]):format(state.anchorModelName, rel)
     end
 
     local function saveNow()
         local hrp = getHRP()
         if not hrp then notify("Character/HRP not ready"); return end
 
-        local anchor = getStandingAnchor()
-        if not anchor then notify("No anchor found (stand on a part/floor)"); return end
+        local model = pickBestAnchorModel()
+        if not model then
+            notify("No anchor model found (stand on house/plot floor)")
+            return
+        end
 
-        local model = anchor:FindFirstAncestorOfClass("Model")
-        state.anchorName = anchor.Name
-        state.modelNameHint = model and model.Name or ""
-        state.relative = anchor.CFrame:ToObjectSpace(hrp.CFrame)
+        local pv = getModelPivot(model)
+        if not pv then
+            notify("Anchor model has no pivot")
+            return
+        end
+
+        state.anchorModelName = model.Name
+        state.relative = pv:ToObjectSpace(hrp.CFrame)
         state.hasData = true
         state.builtScript = buildScriptFromState()
-        notify("Saved ✅ Anchor = "..state.anchorName)
+
+        notify("Saved ✅ AnchorModel = "..state.anchorModelName.." (Pivot)")
     end
 
     local function copyScript()
@@ -218,10 +258,8 @@ end
             notify("No script yet → press Button 1")
             return
         end
-        local ok = false
-        if setclipboard then ok = pcall(function() setclipboard(state.builtScript) end) end
-        if ok then
-            notify("Copied ✅")
+        if trySetClipboard(state.builtScript) then
+            notify("Copied Script ✅")
         else
             print("===== POSITION WARP SCRIPT =====\n"..state.builtScript.."\n===== END =====")
             notify("Clipboard not available → printed in console")
@@ -233,36 +271,50 @@ end
         local hrp = getHRP()
         if not hrp then notify("Character/HRP not ready"); return end
 
-        local anchor = findAnchorInCurrentMap(state.anchorName, hrp.Position, state.modelNameHint)
-        if not anchor then notify("Anchor not found in this map: "..state.anchorName); return end
+        local model = findModelByNameNearest(state.anchorModelName, hrp.Position)
+        if not model then notify("Model not found: "..state.anchorModelName); return end
+        local pv = getModelPivot(model)
+        if not pv then notify("Model has no pivot"); return end
 
-        hrp.CFrame = anchor.CFrame:ToWorldSpace(state.relative)
+        hrp.CFrame = pv:ToWorldSpace(state.relative)
         notify("Warped ✅")
     end
 
-    local function showNumbers()
+    local function fmt3(n) return string.format("%.3f", tonumber(n) or 0) end
+
+    local function showNumbersAndCopy()
         local hrp = getHRP()
         if not hrp then notify("Character/HRP not ready"); return end
 
-        local anchor = getStandingAnchor()
         local p = hrp.Position
+        local under = getStandingPart()
+        local model = pickBestAnchorModel()
+        local pv = model and getModelPivot(model) or nil
 
-        local msg = ("HRP XYZ: %s, %s, %s"):format(fmt3(p.X), fmt3(p.Y), fmt3(p.Z))
-        if anchor then
-            local ap = anchor.Position
-            local rel = anchor.CFrame:ToObjectSpace(hrp.CFrame).Position
-            msg = msg .. ("\nAnchor: %s\nAnchor XYZ: %s, %s, %s\nRel XYZ: %s, %s, %s"):format(
-                anchor.Name,
-                fmt3(ap.X), fmt3(ap.Y), fmt3(ap.Z),
-                fmt3(rel.X), fmt3(rel.Y), fmt3(rel.Z)
-            )
-            print("Anchor FullName:", anchor:GetFullName())
+        local text = ""
+        text = text .. ("HRP Position:\nX=%s\nY=%s\nZ=%s\n\n"):format(fmt3(p.X), fmt3(p.Y), fmt3(p.Z))
+
+        if under then
+            local up = under.Position
+            text = text .. ("Standing Part:\n%s\nX=%s Y=%s Z=%s\n\n"):format(under.Name, fmt3(up.X), fmt3(up.Y), fmt3(up.Z))
         else
-            msg = msg .. "\nAnchor: None"
+            text = text .. "Standing Part:\nNone\n\n"
         end
 
-        notify(msg)
-        print("=== Position Numbers ===\n"..msg.."\n========================")
+        if model and pv then
+            local rel = pv:ToObjectSpace(hrp.CFrame).Position
+            text = text .. ("Anchor Model (Pivot):\n%s\nPivot X=%s Y=%s Z=%s\nRel X=%s Y=%s Z=%s"):format(
+                model.Name,
+                fmt3(pv.Position.X), fmt3(pv.Position.Y), fmt3(pv.Position.Z),
+                fmt3(rel.X), fmt3(rel.Y), fmt3(rel.Z)
+            )
+        else
+            text = text .. "Anchor Model (Pivot):\nNone"
+        end
+
+        print("=== Position Numbers (Copy this) ===\n"..text.."\n==============================")
+        local copied = trySetClipboard(text)
+        notify(copied and "Numbers copied ✅ (see console too)" or "Numbers shown (console) ✅")
     end
 
     -- ===== build UI =====
@@ -273,17 +325,14 @@ end
     sg.ResetOnSpawn = false
     sg.IgnoreGuiInset = true
     sg.Parent = parent
-
-    -- (optional) protect gui if executor supports it
     if syn and syn.protect_gui then pcall(function() syn.protect_gui(sg) end) end
 
     local main = Instance.new("Frame")
     main.Parent = sg
-    main.Size = UDim2.fromOffset(360, 212)
+    main.Size = UDim2.fromOffset(380, 224)
     main.Position = UDim2.new(0, 24, 0, 160)
     main.BackgroundColor3 = Color3.fromRGB(0,0,0)
     main.BorderSizePixel = 0
-
     local uic = Instance.new("UICorner", main); uic.CornerRadius = UDim.new(0, 14)
     local st = Instance.new("UIStroke", main); st.Thickness = 2; st.Color = Color3.fromRGB(25,255,125)
 
@@ -296,7 +345,7 @@ end
     title.TextSize = 16
     title.TextColor3 = Color3.fromRGB(255,255,255)
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = "Position Saver 📍 (Standalone)"
+    title.Text = "Position Saver 📍 (Pivot Anchor)"
 
     local sub = Instance.new("TextLabel")
     sub.Parent = main
@@ -307,7 +356,7 @@ end
     sub.TextSize = 12
     sub.TextColor3 = Color3.fromRGB(200,200,200)
     sub.TextXAlignment = Enum.TextXAlignment.Left
-    sub.Text = "Anchor-under-feet → keep same spot even if house shifted."
+    sub.Text = "Fix: multiple saves stay correct even if house/plot shifts."
 
     local function mkBtn(text, y, onClick)
         local b = Instance.new("TextButton")
@@ -327,10 +376,10 @@ end
         return b
     end
 
-    mkBtn("1) Save Position Script", 66, saveNow)
+    mkBtn("1) Save Position Script (Pivot)", 66, saveNow)
     mkBtn("2) Copy Script", 102, copyScript)
     mkBtn("3) Test Warp", 138, testWarp)
-    mkBtn("4) Show Position Numbers", 174, showNumbers)
+    mkBtn("4) Show + Copy Numbers", 174, showNumbersAndCopy)
 
     -- drag
     local dragging, dragStart, startPos
@@ -353,5 +402,5 @@ end
         end
     end)
 
-    notify("UI Created ✅ Parent = "..where.." | Name = UFO_PosSaver_UI")
+    notify("UI Created ✅ Parent = "..where.." | v4 Pivot Anchor")
 end
