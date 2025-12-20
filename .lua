@@ -1,62 +1,87 @@
---[[ 
-UFO • Position Saver UI (Standalone) v2
-Buttons:
-1) Save Position Script (relative to anchor under your feet)
-2) Copy Script
-3) Test Warp
-4) Show Position Numbers (XYZ + Anchor + Relative)
-]]
-
+-- UFO • Position Saver UI (Standalone) v3 - FIX "not showing"
 do
     local Players = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
     local UIS = game:GetService("UserInputService")
-    local LP = Players.LocalPlayer
+    local StarterGui = game:GetService("StarterGui")
 
+    local LP = Players.LocalPlayer
+    if not LP then return end
+
+    local function notify(msg)
+        msg = tostring(msg)
+        print("[UFO_PosSaver]", msg)
+        pcall(function()
+            StarterGui:SetCore("SendNotification", { Title="Position Saver", Text=msg, Duration=4 })
+        end)
+    end
+
+    -- ===== choose parent safely =====
+    local function getBestGuiParent()
+        -- 1) executor UI container (if exists)
+        if typeof(gethui) == "function" then
+            local ok, hui = pcall(gethui)
+            if ok and hui then return hui, "gethui()" end
+        end
+
+        -- 2) CoreGui (sometimes blocked)
+        local core = game:GetService("CoreGui")
+        if core then return core, "CoreGui" end
+
+        -- 3) PlayerGui fallback
+        local pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
+        return pg, "PlayerGui"
+    end
+
+    -- ===== cleanup old gui =====
+    local function cleanupOld()
+        local core = game:GetService("CoreGui")
+        local pg = LP:FindFirstChildOfClass("PlayerGui")
+
+        for _, parent in ipairs({core, pg}) do
+            if parent then
+                local old = parent:FindFirstChild("UFO_PosSaver_UI")
+                if old then old:Destroy() end
+            end
+        end
+
+        if typeof(gethui) == "function" then
+            local ok, hui = pcall(gethui)
+            if ok and hui then
+                local old = hui:FindFirstChild("UFO_PosSaver_UI")
+                if old then old:Destroy() end
+            end
+        end
+    end
+
+    cleanupOld()
+
+    -- ===== character helpers =====
     local function getChar() return LP.Character end
     local function getHRP()
         local ch = getChar()
         return ch and ch:FindFirstChild("HumanoidRootPart") or nil
     end
 
-    local function notify(msg)
-        pcall(function()
-            game:GetService("StarterGui"):SetCore("SendNotification", {
-                Title = "Position Saver",
-                Text = tostring(msg),
-                Duration = 4
-            })
-        end)
-    end
-
-    --========================
-    -- Anchor Finder (Save)
-    --========================
     local function raycastDown(fromPos)
         local params = RaycastParams.new()
         params.FilterType = Enum.RaycastFilterType.Blacklist
         local ch = getChar()
         params.FilterDescendantsInstances = ch and { ch } or {}
         params.IgnoreWater = true
-
-        return Workspace:Raycast(fromPos, Vector3.new(0, -200, 0), params)
+        return Workspace:Raycast(fromPos, Vector3.new(0, -250, 0), params)
     end
 
     local function getStandingAnchor()
         local hrp = getHRP()
         if not hrp then return nil end
-
-        local result = raycastDown(hrp.Position)
-        if not result or not result.Instance then return nil end
-
-        local inst = result.Instance
-        if not inst:IsA("BasePart") then return nil end
-        return inst
+        local r = raycastDown(hrp.Position)
+        if not r or not r.Instance then return nil end
+        local inst = r.Instance
+        if inst:IsA("BasePart") then return inst end
+        return nil
     end
 
-    --========================
-    -- Anchor Finder (Warp)
-    --========================
     local function dist(a, b)
         local dx = a.X - b.X
         local dy = a.Y - b.Y
@@ -78,25 +103,20 @@ do
                         continue
                     end
                 end
-
                 local dd = dist(d.Position, preferPos)
                 if dd < bestD then bestD = dd; best = d end
             end
         end
-
         return best
     end
 
-    --========================
-    -- Stored State
-    --========================
+    -- ===== stored state =====
     local state = {
         hasData = false,
         anchorName = "",
         modelNameHint = "",
-        relative = nil, -- CFrame
+        relative = nil,
         builtScript = "",
-        lastSaveAt = 0,
     }
 
     local function fmt3(n)
@@ -107,9 +127,7 @@ do
     local function cframeToLua(cf)
         local comps = { cf:GetComponents() }
         local out = {}
-        for i = 1, #comps do
-            out[i] = string.format("%.6f", comps[i])
-        end
+        for i = 1, #comps do out[i] = string.format("%.6f", comps[i]) end
         return ("CFrame.new(%s)"):format(table.concat(out, ","))
     end
 
@@ -118,12 +136,7 @@ do
         local rel = cframeToLua(state.relative)
 
         local scriptText = ([[
---[[ Position Warp Script (Relative to Anchor)
-Saved Anchor Part Name: %s
-Model Hint: %s
-Relative CFrame: %s
-]]
-
+-- Position Warp Script (Relative to Anchor)
 do
     local Players = game:GetService("Players")
     local Workspace = game:GetService("Workspace")
@@ -159,7 +172,6 @@ do
                         continue
                     end
                 end
-
                 local dd = dist(d.Position, preferPos)
                 if dd < bestD then bestD = dd; best = d end
             end
@@ -170,250 +182,176 @@ do
     local function warp()
         local hrp = getHRP()
         if not hrp then return end
-
         local anchor = findAnchor(hrp.Position)
         if not anchor then
             warn("[PositionWarp] Anchor not found:", ANCHOR_NAME)
             return
         end
-
         hrp.CFrame = anchor.CFrame:ToWorldSpace(RELATIVE)
     end
 
     warp()
 end
-]]):format(
-            state.anchorName,
-            state.modelNameHint,
-            rel,
-            state.anchorName,
-            state.modelNameHint,
-            rel
-        )
+]]):format(state.anchorName, state.modelNameHint, rel)
 
         return scriptText
     end
 
     local function saveNow()
         local hrp = getHRP()
-        if not hrp then
-            notify("Character/HRP not ready")
-            return
-        end
+        if not hrp then notify("Character/HRP not ready"); return end
 
         local anchor = getStandingAnchor()
-        if not anchor then
-            notify("No anchor found (stand on a part/floor)")
-            return
-        end
+        if not anchor then notify("No anchor found (stand on a part/floor)"); return end
 
         local model = anchor:FindFirstAncestorOfClass("Model")
         state.anchorName = anchor.Name
         state.modelNameHint = model and model.Name or ""
         state.relative = anchor.CFrame:ToObjectSpace(hrp.CFrame)
         state.hasData = true
-        state.lastSaveAt = os.clock()
-
         state.builtScript = buildScriptFromState()
-        notify("Saved! Anchor = "..state.anchorName)
-    end
-
-    local function testWarp()
-        if not state.hasData or not state.relative then
-            notify("No saved position yet")
-            return
-        end
-
-        local hrp = getHRP()
-        if not hrp then
-            notify("Character/HRP not ready")
-            return
-        end
-
-        local anchor = findAnchorInCurrentMap(state.anchorName, hrp.Position, state.modelNameHint)
-        if not anchor then
-            notify("Anchor not found in this map: "..state.anchorName)
-            return
-        end
-
-        hrp.CFrame = anchor.CFrame:ToWorldSpace(state.relative)
-        notify("Warped ✅ (Anchor: "..anchor.Name..")")
+        notify("Saved ✅ Anchor = "..state.anchorName)
     end
 
     local function copyScript()
         if not state.builtScript or state.builtScript == "" then
-            notify("No script built yet (press Button 1)")
+            notify("No script yet → press Button 1")
             return
         end
-
         local ok = false
-        if setclipboard then
-            ok = pcall(function() setclipboard(state.builtScript) end)
-        end
-
+        if setclipboard then ok = pcall(function() setclipboard(state.builtScript) end) end
         if ok then
-            notify("Copied to clipboard ✅")
+            notify("Copied ✅")
         else
-            print("===== POSITION WARP SCRIPT =====")
-            print(state.builtScript)
-            print("===== END =====")
+            print("===== POSITION WARP SCRIPT =====\n"..state.builtScript.."\n===== END =====")
             notify("Clipboard not available → printed in console")
         end
     end
 
-    --========================
-    -- Button 4: Show numbers
-    --========================
+    local function testWarp()
+        if not state.hasData or not state.relative then notify("No saved position yet"); return end
+        local hrp = getHRP()
+        if not hrp then notify("Character/HRP not ready"); return end
+
+        local anchor = findAnchorInCurrentMap(state.anchorName, hrp.Position, state.modelNameHint)
+        if not anchor then notify("Anchor not found in this map: "..state.anchorName); return end
+
+        hrp.CFrame = anchor.CFrame:ToWorldSpace(state.relative)
+        notify("Warped ✅")
+    end
+
     local function showNumbers()
         local hrp = getHRP()
-        if not hrp then
-            notify("Character/HRP not ready")
-            return
-        end
+        if not hrp then notify("Character/HRP not ready"); return end
 
         local anchor = getStandingAnchor()
-        local ax = anchor and anchor.Position.X or 0
-        local ay = anchor and anchor.Position.Y or 0
-        local az = anchor and anchor.Position.Z or 0
-
-        local relTxt = "nil"
-        if anchor then
-            local rel = anchor.CFrame:ToObjectSpace(hrp.CFrame)
-            local p = rel.Position
-            relTxt = ("Rel XYZ: %s, %s, %s"):format(fmt3(p.X), fmt3(p.Y), fmt3(p.Z))
-        end
-
         local p = hrp.Position
-        local msg =
-            ("HRP XYZ: %s, %s, %s\nAnchor: %s\nAnchor XYZ: %s, %s, %s\n%s"):format(
-                fmt3(p.X), fmt3(p.Y), fmt3(p.Z),
-                anchor and anchor.Name or "None",
-                fmt3(ax), fmt3(ay), fmt3(az),
-                relTxt
+
+        local msg = ("HRP XYZ: %s, %s, %s"):format(fmt3(p.X), fmt3(p.Y), fmt3(p.Z))
+        if anchor then
+            local ap = anchor.Position
+            local rel = anchor.CFrame:ToObjectSpace(hrp.CFrame).Position
+            msg = msg .. ("\nAnchor: %s\nAnchor XYZ: %s, %s, %s\nRel XYZ: %s, %s, %s"):format(
+                anchor.Name,
+                fmt3(ap.X), fmt3(ap.Y), fmt3(ap.Z),
+                fmt3(rel.X), fmt3(rel.Y), fmt3(rel.Z)
             )
+            print("Anchor FullName:", anchor:GetFullName())
+        else
+            msg = msg .. "\nAnchor: None"
+        end
 
         notify(msg)
-
-        -- extra: print full for copy/manual debug
-        print("=== Position Numbers ===")
-        print(msg)
-        if anchor then
-            print("Anchor FullName:", anchor:GetFullName())
-        end
-        print("========================")
+        print("=== Position Numbers ===\n"..msg.."\n========================")
     end
 
-    --========================
-    -- Minimal Standalone UI
-    --========================
-    local function makeGui()
-        local sg = Instance.new("ScreenGui")
-        sg.Name = "UFO_PosSaver_UI"
-        sg.ResetOnSpawn = false
-        sg.IgnoreGuiInset = true
-        pcall(function()
-            sg.Parent = game:GetService("CoreGui")
-        end)
-        if not sg.Parent then
-            sg.Parent = LP:WaitForChild("PlayerGui")
-        end
+    -- ===== build UI =====
+    local parent, where = getBestGuiParent()
 
-        local main = Instance.new("Frame")
-        main.Parent = sg
-        main.Size = UDim2.fromOffset(360, 210) -- ✅ taller for button 4
-        main.Position = UDim2.new(0, 24, 0, 160)
-        main.BackgroundColor3 = Color3.fromRGB(0,0,0)
-        main.BorderSizePixel = 0
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "UFO_PosSaver_UI"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.Parent = parent
 
-        local uic = Instance.new("UICorner", main)
-        uic.CornerRadius = UDim.new(0, 14)
+    -- (optional) protect gui if executor supports it
+    if syn and syn.protect_gui then pcall(function() syn.protect_gui(sg) end) end
 
-        local stroke = Instance.new("UIStroke", main)
-        stroke.Thickness = 2
-        stroke.Color = Color3.fromRGB(25,255,125)
+    local main = Instance.new("Frame")
+    main.Parent = sg
+    main.Size = UDim2.fromOffset(360, 212)
+    main.Position = UDim2.new(0, 24, 0, 160)
+    main.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    main.BorderSizePixel = 0
 
-        local title = Instance.new("TextLabel")
-        title.Parent = main
-        title.BackgroundTransparency = 1
-        title.Size = UDim2.new(1, -20, 0, 34)
-        title.Position = UDim2.new(0, 12, 0, 6)
-        title.Font = Enum.Font.GothamBold
-        title.TextSize = 16
-        title.TextColor3 = Color3.fromRGB(255,255,255)
-        title.TextXAlignment = Enum.TextXAlignment.Left
-        title.Text = "Position Saver 📍 (Standalone)"
+    local uic = Instance.new("UICorner", main); uic.CornerRadius = UDim.new(0, 14)
+    local st = Instance.new("UIStroke", main); st.Thickness = 2; st.Color = Color3.fromRGB(25,255,125)
 
-        local sub = Instance.new("TextLabel")
-        sub.Parent = main
-        sub.BackgroundTransparency = 1
-        sub.Size = UDim2.new(1, -20, 0, 22)
-        sub.Position = UDim2.new(0, 12, 0, 36)
-        sub.Font = Enum.Font.Gotham
-        sub.TextSize = 12
-        sub.TextColor3 = Color3.fromRGB(200,200,200)
-        sub.TextXAlignment = Enum.TextXAlignment.Left
-        sub.Text = "Uses anchor-under-feet → same house but shifted still matches."
+    local title = Instance.new("TextLabel")
+    title.Parent = main
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -20, 0, 34)
+    title.Position = UDim2.new(0, 12, 0, 6)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    title.TextColor3 = Color3.fromRGB(255,255,255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "Position Saver 📍 (Standalone)"
 
-        local function mkBtn(text, y, onClick)
-            local b = Instance.new("TextButton")
-            b.Parent = main
-            b.Size = UDim2.new(1, -24, 0, 32)
-            b.Position = UDim2.new(0, 12, 0, y)
-            b.BackgroundColor3 = Color3.fromRGB(0,0,0)
-            b.TextColor3 = Color3.fromRGB(255,255,255)
-            b.Font = Enum.Font.GothamBold
-            b.TextSize = 13
-            b.Text = text
-            b.AutoButtonColor = false
-            b.BorderSizePixel = 0
+    local sub = Instance.new("TextLabel")
+    sub.Parent = main
+    sub.BackgroundTransparency = 1
+    sub.Size = UDim2.new(1, -20, 0, 22)
+    sub.Position = UDim2.new(0, 12, 0, 36)
+    sub.Font = Enum.Font.Gotham
+    sub.TextSize = 12
+    sub.TextColor3 = Color3.fromRGB(200,200,200)
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Text = "Anchor-under-feet → keep same spot even if house shifted."
 
-            local c = Instance.new("UICorner", b)
-            c.CornerRadius = UDim.new(0, 12)
+    local function mkBtn(text, y, onClick)
+        local b = Instance.new("TextButton")
+        b.Parent = main
+        b.Size = UDim2.new(1, -24, 0, 32)
+        b.Position = UDim2.new(0, 12, 0, y)
+        b.BackgroundColor3 = Color3.fromRGB(0,0,0)
+        b.TextColor3 = Color3.fromRGB(255,255,255)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 13
+        b.Text = text
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        local c = Instance.new("UICorner", b); c.CornerRadius = UDim.new(0, 12)
+        local s = Instance.new("UIStroke", b); s.Thickness = 1.8; s.Color = Color3.fromRGB(25,255,125)
+        b.MouseButton1Click:Connect(function() pcall(onClick) end)
+        return b
+    end
 
-            local s = Instance.new("UIStroke", b)
-            s.Thickness = 1.8
-            s.Color = Color3.fromRGB(25,255,125)
+    mkBtn("1) Save Position Script", 66, saveNow)
+    mkBtn("2) Copy Script", 102, copyScript)
+    mkBtn("3) Test Warp", 138, testWarp)
+    mkBtn("4) Show Position Numbers", 174, showNumbers)
 
-            b.MouseButton1Click:Connect(function()
-                pcall(onClick)
+    -- drag
+    local dragging, dragStart, startPos
+    main.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
             end)
-            return b
         end
+    end)
 
-        mkBtn("1) Save Position Script", 66, saveNow)
-        mkBtn("2) Copy Script", 102, copyScript)
-        mkBtn("3) Test Warp", 138, testWarp)
-        mkBtn("4) Show Position Numbers", 174, showNumbers) -- ✅ new
+    UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
 
-        -- drag
-        local dragging, dragStart, startPos
-        main.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPos = main.Position
-                input.Changed:Connect(function()
-                    if input.UserInputState == Enum.UserInputState.End then
-                        dragging = false
-                    end
-                end)
-            end
-        end)
-
-        UIS.InputChanged:Connect(function(input)
-            if not dragging then return end
-            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-                local delta = input.Position - dragStart
-                main.Position = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset + delta.X,
-                    startPos.Y.Scale, startPos.Y.Offset + delta.Y
-                )
-            end
-        end)
-
-        return sg
-    end
-
-    makeGui()
-    notify("Loaded Position Saver UI (4 buttons)")
+    notify("UI Created ✅ Parent = "..where.." | Name = UFO_PosSaver_UI")
 end
