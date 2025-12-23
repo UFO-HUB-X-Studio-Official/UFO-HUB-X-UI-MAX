@@ -1,406 +1,505 @@
--- UFO • Position Saver UI (Standalone) v4 - PIVOT ANCHOR + Copy Numbers
-do
-    local Players = game:GetService("Players")
-    local Workspace = game:GetService("Workspace")
-    local UIS = game:GetService("UserInputService")
-    local StarterGui = game:GetService("StarterGui")
+--// ===== Exploit Remote Monitor + Admin UI (Roblox) =====
+--// Paste as ONE script in ServerScriptService
+--// What it does:
+--// 1) Hooks RemoteEvents/RemoteFunctions callbacks to log who called + args
+--// 2) Admin can open a live log UI (client) and filter/search
+--// 3) Basic spam detection (rate) to highlight suspicious callers
+--// Notes:
+--// - You CANNOT see hacker "code", only the Remote name + arguments they sent.
+--// - This helps you patch server-side validation on the specific remotes.
 
-    local LP = Players.LocalPlayer
-    if not LP then return end
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
 
-    local function notify(msg)
-        msg = tostring(msg)
-        print("[UFO_PosSaver]", msg)
-        pcall(function()
-            StarterGui:SetCore("SendNotification", { Title="Position Saver", Text=msg, Duration=4 })
-        end)
-    end
+--========================
+-- CONFIG
+--========================
+local ADMIN_USER_IDS = {
+	-- ใส่ UserId ของคุณ/ทีมงาน
+	-- ตัวอย่าง: [12345678] = true,
+}
+-- ถ้าไม่ใส่เลย จะให้เจ้าของเกม (Creator) ดูได้อัตโนมัติ
+local ALLOW_CREATOR = true
 
-    local function trySetClipboard(text)
-        if setclipboard then
-            local ok = pcall(function() setclipboard(tostring(text)) end)
-            return ok
-        end
-        return false
-    end
+local MAX_LOGS = 600          -- จำนวน log เก็บสูงสุด (ring buffer)
+local MAX_ARG_CHARS = 1400    -- จำกัดความยาว args ที่ serialize (กัน UI หน่วง/โดนปั่น)
+local RATE_WINDOW = 3         -- วินาที
+local RATE_LIMIT = 18         -- เรียกเกินนี้ใน window = ติดธง suspicious
 
-    -- ===== choose parent safely =====
-    local function getBestGuiParent()
-        if typeof(gethui) == "function" then
-            local ok, hui = pcall(gethui)
-            if ok and hui then return hui, "gethui()" end
-        end
-        local core = game:GetService("CoreGui")
-        if core then return core, "CoreGui" end
-        local pg = LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
-        return pg, "PlayerGui"
-    end
+--========================
+-- Remote for admin UI
+--========================
+local MON_FOLDER = ReplicatedStorage:FindFirstChild("_UFOX_MONITOR") or Instance.new("Folder")
+MON_FOLDER.Name = "_UFOX_MONITOR"
+MON_FOLDER.Parent = ReplicatedStorage
 
-    -- ===== cleanup old gui =====
-    local function cleanupOld()
-        local core = game:GetService("CoreGui")
-        local pg = LP:FindFirstChildOfClass("PlayerGui")
+local RF_GET = MON_FOLDER:FindFirstChild("GetLogs") or Instance.new("RemoteFunction")
+RF_GET.Name = "GetLogs"
+RF_GET.Parent = MON_FOLDER
 
-        for _, parent in ipairs({core, pg}) do
-            if parent then
-                local old = parent:FindFirstChild("UFO_PosSaver_UI")
-                if old then old:Destroy() end
-            end
-        end
+local RE_PUSH = MON_FOLDER:FindFirstChild("Push") or Instance.new("RemoteEvent")
+RE_PUSH.Name = "Push"
+RE_PUSH.Parent = MON_FOLDER
 
-        if typeof(gethui) == "function" then
-            local ok, hui = pcall(gethui)
-            if ok and hui then
-                local old = hui:FindFirstChild("UFO_PosSaver_UI")
-                if old then old:Destroy() end
-            end
-        end
-    end
+local RE_CMD = MON_FOLDER:FindFirstChild("Cmd") or Instance.new("RemoteEvent")
+RE_CMD.Name = "Cmd"
+RE_CMD.Parent = MON_FOLDER
 
-    cleanupOld()
-
-    -- ===== character helpers =====
-    local function getChar() return LP.Character end
-    local function getHRP()
-        local ch = getChar()
-        return ch and ch:FindFirstChild("HumanoidRootPart") or nil
-    end
-
-    local function raycastDown(fromPos)
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Blacklist
-        local ch = getChar()
-        params.FilterDescendantsInstances = ch and { ch } or {}
-        params.IgnoreWater = true
-        return Workspace:Raycast(fromPos, Vector3.new(0, -350, 0), params)
-    end
-
-    local function getStandingPart()
-        local hrp = getHRP()
-        if not hrp then return nil end
-        local r = raycastDown(hrp.Position)
-        if r and r.Instance and r.Instance:IsA("BasePart") then
-            return r.Instance
-        end
-        return nil
-    end
-
-    local function dist(a, b)
-        local dx = a.X - b.X
-        local dy = a.Y - b.Y
-        local dz = a.Z - b.Z
-        return math.sqrt(dx*dx + dy*dy + dz*dz)
-    end
-
-    -- ===== Pivot Anchor logic =====
-    local function getModelPivot(m)
-        local ok, pv = pcall(function() return m:GetPivot() end)
-        if ok and typeof(pv) == "CFrame" then return pv end
-        return nil
-    end
-
-    local function pickBestAnchorModel()
-        local hrp = getHRP()
-        if not hrp then return nil end
-
-        local under = getStandingPart()
-        if not under then return nil end
-
-        -- Prefer nearest ancestor Model
-        local model = under:FindFirstAncestorOfClass("Model")
-        if model and getModelPivot(model) then
-            return model
-        end
-
-        -- Fallback: find any model nearby by pivot
-        local best, bestD = nil, math.huge
-        local p = hrp.Position
-        for _, d in ipairs(Workspace:GetDescendants()) do
-            if d:IsA("Model") then
-                local pv = getModelPivot(d)
-                if pv then
-                    local dd = dist(pv.Position, p)
-                    if dd < bestD then
-                        bestD = dd
-                        best = d
-                    end
-                end
-            end
-        end
-        return best
-    end
-
-    local function findModelByNameNearest(name, preferPos)
-        local best, bestD = nil, math.huge
-        preferPos = preferPos or (getHRP() and getHRP().Position) or Vector3.new(0,0,0)
-
-        for _, d in ipairs(Workspace:GetDescendants()) do
-            if d:IsA("Model") and d.Name == name then
-                local pv = getModelPivot(d)
-                if pv then
-                    local dd = dist(pv.Position, preferPos)
-                    if dd < bestD then
-                        bestD = dd
-                        best = d
-                    end
-                end
-            end
-        end
-        return best
-    end
-
-    local function cframeToLua(cf)
-        local comps = { cf:GetComponents() }
-        local out = {}
-        for i = 1, #comps do out[i] = string.format("%.6f", comps[i]) end
-        return ("CFrame.new(%s)"):format(table.concat(out, ","))
-    end
-
-    -- ===== stored state =====
-    local state = {
-        hasData = false,
-        anchorModelName = "",
-        relative = nil,
-        builtScript = "",
-    }
-
-    local function buildScriptFromState()
-        if not state.hasData or not state.relative then return "" end
-        local rel = cframeToLua(state.relative)
-
-        return ([[
--- Position Warp Script (Relative to Model Pivot)
-do
-    local Players = game:GetService("Players")
-    local Workspace = game:GetService("Workspace")
-    local LP = Players.LocalPlayer
-
-    local ANCHOR_MODEL_NAME = %q
-    local RELATIVE = %s
-
-    local function getHRP()
-        local ch = LP.Character
-        return ch and ch:FindFirstChild("HumanoidRootPart") or nil
-    end
-
-    local function dist(a, b)
-        local dx = a.X - b.X
-        local dy = a.Y - b.Y
-        local dz = a.Z - b.Z
-        return math.sqrt(dx*dx + dy*dy + dz*dz)
-    end
-
-    local function getPivot(m)
-        local ok, pv = pcall(function() return m:GetPivot() end)
-        if ok and typeof(pv) == "CFrame" then return pv end
-        return nil
-    end
-
-    local function findModelNearest(name, preferPos)
-        local best, bestD = nil, math.huge
-        preferPos = preferPos or Vector3.new(0,0,0)
-        for _, d in ipairs(Workspace:GetDescendants()) do
-            if d:IsA("Model") and d.Name == name then
-                local pv = getPivot(d)
-                if pv then
-                    local dd = dist(pv.Position, preferPos)
-                    if dd < bestD then bestD = dd; best = d end
-                end
-            end
-        end
-        return best
-    end
-
-    local function warp()
-        local hrp = getHRP()
-        if not hrp then return end
-        local m = findModelNearest(ANCHOR_MODEL_NAME, hrp.Position)
-        if not m then
-            warn("[PositionWarp] Model not found:", ANCHOR_MODEL_NAME)
-            return
-        end
-        local pv = getPivot(m)
-        if not pv then return end
-        hrp.CFrame = pv:ToWorldSpace(RELATIVE)
-    end
-
-    warp()
+--========================
+-- Utilities
+--========================
+local function isAdmin(plr: Player)
+	if ADMIN_USER_IDS[plr.UserId] then return true end
+	if ALLOW_CREATOR then
+		local creatorId = game.CreatorId
+		local creatorType = game.CreatorType
+		if creatorType == Enum.CreatorType.User and plr.UserId == creatorId then
+			return true
+		end
+	end
+	return false
 end
-]]):format(state.anchorModelName, rel)
-    end
 
-    local function saveNow()
-        local hrp = getHRP()
-        if not hrp then notify("Character/HRP not ready"); return end
+local function safeToString(v, depth)
+	depth = depth or 0
+	if depth > 3 then return "<depth_limit>" end
 
-        local model = pickBestAnchorModel()
-        if not model then
-            notify("No anchor model found (stand on house/plot floor)")
-            return
-        end
-
-        local pv = getModelPivot(model)
-        if not pv then
-            notify("Anchor model has no pivot")
-            return
-        end
-
-        state.anchorModelName = model.Name
-        state.relative = pv:ToObjectSpace(hrp.CFrame)
-        state.hasData = true
-        state.builtScript = buildScriptFromState()
-
-        notify("Saved ✅ AnchorModel = "..state.anchorModelName.." (Pivot)")
-    end
-
-    local function copyScript()
-        if not state.builtScript or state.builtScript == "" then
-            notify("No script yet → press Button 1")
-            return
-        end
-        if trySetClipboard(state.builtScript) then
-            notify("Copied Script ✅")
-        else
-            print("===== POSITION WARP SCRIPT =====\n"..state.builtScript.."\n===== END =====")
-            notify("Clipboard not available → printed in console")
-        end
-    end
-
-    local function testWarp()
-        if not state.hasData or not state.relative then notify("No saved position yet"); return end
-        local hrp = getHRP()
-        if not hrp then notify("Character/HRP not ready"); return end
-
-        local model = findModelByNameNearest(state.anchorModelName, hrp.Position)
-        if not model then notify("Model not found: "..state.anchorModelName); return end
-        local pv = getModelPivot(model)
-        if not pv then notify("Model has no pivot"); return end
-
-        hrp.CFrame = pv:ToWorldSpace(state.relative)
-        notify("Warped ✅")
-    end
-
-    local function fmt3(n) return string.format("%.3f", tonumber(n) or 0) end
-
-    local function showNumbersAndCopy()
-        local hrp = getHRP()
-        if not hrp then notify("Character/HRP not ready"); return end
-
-        local p = hrp.Position
-        local under = getStandingPart()
-        local model = pickBestAnchorModel()
-        local pv = model and getModelPivot(model) or nil
-
-        local text = ""
-        text = text .. ("HRP Position:\nX=%s\nY=%s\nZ=%s\n\n"):format(fmt3(p.X), fmt3(p.Y), fmt3(p.Z))
-
-        if under then
-            local up = under.Position
-            text = text .. ("Standing Part:\n%s\nX=%s Y=%s Z=%s\n\n"):format(under.Name, fmt3(up.X), fmt3(up.Y), fmt3(up.Z))
-        else
-            text = text .. "Standing Part:\nNone\n\n"
-        end
-
-        if model and pv then
-            local rel = pv:ToObjectSpace(hrp.CFrame).Position
-            text = text .. ("Anchor Model (Pivot):\n%s\nPivot X=%s Y=%s Z=%s\nRel X=%s Y=%s Z=%s"):format(
-                model.Name,
-                fmt3(pv.Position.X), fmt3(pv.Position.Y), fmt3(pv.Position.Z),
-                fmt3(rel.X), fmt3(rel.Y), fmt3(rel.Z)
-            )
-        else
-            text = text .. "Anchor Model (Pivot):\nNone"
-        end
-
-        print("=== Position Numbers (Copy this) ===\n"..text.."\n==============================")
-        local copied = trySetClipboard(text)
-        notify(copied and "Numbers copied ✅ (see console too)" or "Numbers shown (console) ✅")
-    end
-
-    -- ===== build UI =====
-    local parent, where = getBestGuiParent()
-
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "UFO_PosSaver_UI"
-    sg.ResetOnSpawn = false
-    sg.IgnoreGuiInset = true
-    sg.Parent = parent
-    if syn and syn.protect_gui then pcall(function() syn.protect_gui(sg) end) end
-
-    local main = Instance.new("Frame")
-    main.Parent = sg
-    main.Size = UDim2.fromOffset(380, 224)
-    main.Position = UDim2.new(0, 24, 0, 160)
-    main.BackgroundColor3 = Color3.fromRGB(0,0,0)
-    main.BorderSizePixel = 0
-    local uic = Instance.new("UICorner", main); uic.CornerRadius = UDim.new(0, 14)
-    local st = Instance.new("UIStroke", main); st.Thickness = 2; st.Color = Color3.fromRGB(25,255,125)
-
-    local title = Instance.new("TextLabel")
-    title.Parent = main
-    title.BackgroundTransparency = 1
-    title.Size = UDim2.new(1, -20, 0, 34)
-    title.Position = UDim2.new(0, 12, 0, 6)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 16
-    title.TextColor3 = Color3.fromRGB(255,255,255)
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Text = "Position Saver 📍 (Pivot Anchor)"
-
-    local sub = Instance.new("TextLabel")
-    sub.Parent = main
-    sub.BackgroundTransparency = 1
-    sub.Size = UDim2.new(1, -20, 0, 22)
-    sub.Position = UDim2.new(0, 12, 0, 36)
-    sub.Font = Enum.Font.Gotham
-    sub.TextSize = 12
-    sub.TextColor3 = Color3.fromRGB(200,200,200)
-    sub.TextXAlignment = Enum.TextXAlignment.Left
-    sub.Text = "Fix: multiple saves stay correct even if house/plot shifts."
-
-    local function mkBtn(text, y, onClick)
-        local b = Instance.new("TextButton")
-        b.Parent = main
-        b.Size = UDim2.new(1, -24, 0, 32)
-        b.Position = UDim2.new(0, 12, 0, y)
-        b.BackgroundColor3 = Color3.fromRGB(0,0,0)
-        b.TextColor3 = Color3.fromRGB(255,255,255)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 13
-        b.Text = text
-        b.AutoButtonColor = false
-        b.BorderSizePixel = 0
-        local c = Instance.new("UICorner", b); c.CornerRadius = UDim.new(0, 12)
-        local s = Instance.new("UIStroke", b); s.Thickness = 1.8; s.Color = Color3.fromRGB(25,255,125)
-        b.MouseButton1Click:Connect(function() pcall(onClick) end)
-        return b
-    end
-
-    mkBtn("1) Save Position Script (Pivot)", 66, saveNow)
-    mkBtn("2) Copy Script", 102, copyScript)
-    mkBtn("3) Test Warp", 138, testWarp)
-    mkBtn("4) Show + Copy Numbers", 174, showNumbersAndCopy)
-
-    -- drag
-    local dragging, dragStart, startPos
-    main.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-
-    UIS.InputChanged:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - dragStart
-            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-
-    notify("UI Created ✅ Parent = "..where.." | v4 Pivot Anchor")
+	local t = typeof(v)
+	if t == "string" then
+		if #v > 220 then return v:sub(1, 220) .. "...(+)" end
+		return v
+	elseif t == "number" or t == "boolean" or t == "nil" then
+		return tostring(v)
+	elseif t == "Instance" then
+		return ("<%s:%s>"):format(v.ClassName, v.Name)
+	elseif t == "Vector3" or t == "CFrame" or t == "Color3" then
+		return tostring(v)
+	elseif t == "table" then
+		local out = {}
+		local n = 0
+		for k, val in pairs(v) do
+			n += 1
+			if n > 20 then
+				out[#out+1] = "...(+more)"
+				break
+			end
+			out[#out+1] = ("[%s]=%s"):format(safeToString(k, depth+1), safeToString(val, depth+1))
+		end
+		return "{ " .. table.concat(out, ", ") .. " }"
+	else
+		return ("<%s>"):format(t)
+	end
 end
+
+local function packArgs(...)
+	local arr = table.pack(...)
+	local parts = {}
+	for i = 1, arr.n do
+		parts[#parts+1] = safeToString(arr[i], 0)
+	end
+	local s = table.concat(parts, " | ")
+	if #s > MAX_ARG_CHARS then
+		s = s:sub(1, MAX_ARG_CHARS) .. "...(trunc)"
+	end
+	return s
+end
+
+--========================
+-- Ring Buffer Logs
+--========================
+local LOGS = {}
+local logHead = 0
+local logCount = 0
+local logId = 0
+
+local function addLog(entry)
+	logId += 1
+	entry.id = logId
+
+	logHead = (logHead % MAX_LOGS) + 1
+	LOGS[logHead] = entry
+	logCount = math.min(logCount + 1, MAX_LOGS)
+
+	-- push to admins live
+	RE_PUSH:FireAllClients(entry)
+end
+
+local function getAllLogs()
+	local out = {}
+	-- oldest -> newest
+	local start = (logHead - logCount + 1)
+	for i = 0, logCount - 1 do
+		local idx = ((start + i - 1) % MAX_LOGS) + 1
+		out[#out+1] = LOGS[idx]
+	end
+	return out
+end
+
+--========================
+-- Rate tracking (suspicious)
+--========================
+local RATE = {} -- [userId][key] = {t0, count}
+local function bumpRate(userId, key)
+	local now = os.clock()
+	RATE[userId] = RATE[userId] or {}
+	local r = RATE[userId][key]
+	if not r then
+		r = { t0 = now, count = 0 }
+		RATE[userId][key] = r
+	end
+	if (now - r.t0) > RATE_WINDOW then
+		r.t0 = now
+		r.count = 0
+	end
+	r.count += 1
+	return r.count
+end
+
+--========================
+-- Hooking Remotes
+--========================
+local function hookRemoteEvent(re: RemoteEvent, path: string)
+	if re:GetAttribute("__UFOX_HOOKED") then return end
+	re:SetAttribute("__UFOX_HOOKED", true)
+
+	local old = re.OnServerEvent
+	re.OnServerEvent = function(plr: Player, ...)
+		local args = packArgs(...)
+		local rateKey = ("RE:%s"):format(path)
+		local c = bumpRate(plr.UserId, rateKey)
+
+		addLog({
+			kind = "RemoteEvent",
+			remote = re.Name,
+			path = path,
+			player = ("%s (%d)"):format(plr.Name, plr.UserId),
+			args = args,
+			rate = c,
+			suspicious = (c >= RATE_LIMIT),
+			time = os.date("!%Y-%m-%d %H:%M:%S") .. "Z",
+		})
+
+		if typeof(old) == "function" then
+			return old(plr, ...)
+		end
+	end
+end
+
+local function hookRemoteFunction(rf: RemoteFunction, path: string)
+	if rf:GetAttribute("__UFOX_HOOKED") then return end
+	rf:SetAttribute("__UFOX_HOOKED", true)
+
+	local old = rf.OnServerInvoke
+	rf.OnServerInvoke = function(plr: Player, ...)
+		local args = packArgs(...)
+		local rateKey = ("RF:%s"):format(path)
+		local c = bumpRate(plr.UserId, rateKey)
+
+		addLog({
+			kind = "RemoteFunction",
+			remote = rf.Name,
+			path = path,
+			player = ("%s (%d)"):format(plr.Name, plr.UserId),
+			args = args,
+			rate = c,
+			suspicious = (c >= RATE_LIMIT),
+			time = os.date("!%Y-%m-%d %H:%M:%S") .. "Z",
+		})
+
+		if typeof(old) == "function" then
+			return old(plr, ...)
+		end
+		-- default: nil
+		return nil
+	end
+end
+
+local function fullPath(inst: Instance)
+	local parts = {}
+	local cur = inst
+	while cur and cur ~= game do
+		parts[#parts+1] = cur.Name
+		cur = cur.Parent
+	end
+	table.reverse(parts)
+	return table.concat(parts, ".")
+end
+
+local function scanAndHook(root: Instance)
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("RemoteEvent") then
+			hookRemoteEvent(d, fullPath(d))
+		elseif d:IsA("RemoteFunction") then
+			hookRemoteFunction(d, fullPath(d))
+		end
+	end
+end
+
+-- initial scan
+scanAndHook(game)
+
+-- hook newly added remotes
+game.DescendantAdded:Connect(function(d)
+	if d:IsA("RemoteEvent") then
+		hookRemoteEvent(d, fullPath(d))
+	elseif d:IsA("RemoteFunction") then
+		hookRemoteFunction(d, fullPath(d))
+	end
+end)
+
+--========================
+-- Admin UI injection (client)
+--========================
+local CLIENT_UI_SOURCE = [[
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local F = ReplicatedStorage:WaitForChild("_UFOX_MONITOR")
+local RF_GET = F:WaitForChild("GetLogs")
+local RE_PUSH = F:WaitForChild("Push")
+local RE_CMD = F:WaitForChild("Cmd")
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "UFOX_RemoteMonitor"
+gui.ResetOnSpawn = false
+gui.Parent = LP:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Parent = gui
+main.Size = UDim2.fromOffset(640, 360)
+main.Position = UDim2.new(1, -660, 1, -390)
+main.BackgroundColor3 = Color3.fromRGB(10,10,10)
+main.BorderSizePixel = 0
+
+local uic = Instance.new("UICorner", main); uic.CornerRadius = UDim.new(0, 12)
+local st = Instance.new("UIStroke", main); st.Thickness = 2; st.Color = Color3.fromRGB(25,255,125)
+
+local top = Instance.new("Frame", main)
+top.Size = UDim2.new(1,0,0,42)
+top.BackgroundTransparency = 1
+
+local title = Instance.new("TextLabel", top)
+title.BackgroundTransparency = 1
+title.Position = UDim2.new(0,12,0,0)
+title.Size = UDim2.new(1,-24,1,0)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(255,255,255)
+title.Text = "Remote Monitor (Server Logs)"
+
+local search = Instance.new("TextBox", main)
+search.Position = UDim2.new(0,12,0,48)
+search.Size = UDim2.new(1,-24,0,30)
+search.PlaceholderText = "ค้นหา: player / remote / args / path"
+search.Text = ""
+search.ClearTextOnFocus = false
+search.Font = Enum.Font.Gotham
+search.TextSize = 14
+search.TextColor3 = Color3.fromRGB(255,255,255)
+search.BackgroundColor3 = Color3.fromRGB(0,0,0)
+local sc = Instance.new("UICorner", search); sc.CornerRadius = UDim.new(0,10)
+local ss = Instance.new("UIStroke", search); ss.Thickness = 1.6; ss.Color = Color3.fromRGB(25,255,125)
+
+local btnClear = Instance.new("TextButton", main)
+btnClear.Position = UDim2.new(0,12,1,-38)
+btnClear.Size = UDim2.fromOffset(120,28)
+btnClear.Text = "Clear"
+btnClear.Font = Enum.Font.GothamBold
+btnClear.TextSize = 14
+btnClear.TextColor3 = Color3.fromRGB(255,255,255)
+btnClear.BackgroundColor3 = Color3.fromRGB(0,0,0)
+btnClear.AutoButtonColor = false
+local bc = Instance.new("UICorner", btnClear); bc.CornerRadius = UDim.new(0,10)
+local bs = Instance.new("UIStroke", btnClear); bs.Thickness = 1.6; bs.Color = Color3.fromRGB(255,40,40)
+
+local btnRefresh = Instance.new("TextButton", main)
+btnRefresh.Position = UDim2.new(0,140,1,-38)
+btnRefresh.Size = UDim2.fromOffset(120,28)
+btnRefresh.Text = "Refresh"
+btnRefresh.Font = Enum.Font.GothamBold
+btnRefresh.TextSize = 14
+btnRefresh.TextColor3 = Color3.fromRGB(255,255,255)
+btnRefresh.BackgroundColor3 = Color3.fromRGB(0,0,0)
+btnRefresh.AutoButtonColor = false
+local rc = Instance.new("UICorner", btnRefresh); rc.CornerRadius = UDim.new(0,10)
+local rs = Instance.new("UIStroke", btnRefresh); rs.Thickness = 1.6; rs.Color = Color3.fromRGB(25,255,125)
+
+local list = Instance.new("ScrollingFrame", main)
+list.Position = UDim2.new(0,12,0,86)
+list.Size = UDim2.new(1,-24,1,-136)
+list.BackgroundTransparency = 1
+list.ScrollBarThickness = 6
+list.CanvasSize = UDim2.new(0,0,0,0)
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+local lay = Instance.new("UIListLayout", list)
+lay.Padding = UDim.new(0,8)
+lay.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function norm(s)
+	s = tostring(s or ""):lower()
+	s = s:gsub("%s+"," ")
+	return s
+end
+
+local cards = {}
+local function makeCard(e)
+	local f = Instance.new("Frame")
+	f.Size = UDim2.new(1,0,0,86)
+	f.BackgroundColor3 = Color3.fromRGB(0,0,0)
+	f.BorderSizePixel = 0
+	local c = Instance.new("UICorner", f); c.CornerRadius = UDim.new(0,12)
+	local s = Instance.new("UIStroke", f); s.Thickness = 1.6
+	s.Color = e.suspicious and Color3.fromRGB(255,40,40) or Color3.fromRGB(25,255,125)
+
+	local t = Instance.new("TextLabel", f)
+	t.BackgroundTransparency = 1
+	t.Position = UDim2.new(0,12,0,8)
+	t.Size = UDim2.new(1,-24,0,18)
+	t.Font = Enum.Font.GothamBold
+	t.TextSize = 13
+	t.TextXAlignment = Enum.TextXAlignment.Left
+	t.TextColor3 = Color3.fromRGB(255,255,255)
+	t.Text = string.format("[%s] %s • %s", e.kind, e.remote, e.time)
+
+	local p = Instance.new("TextLabel", f)
+	p.BackgroundTransparency = 1
+	p.Position = UDim2.new(0,12,0,28)
+	p.Size = UDim2.new(1,-24,0,18)
+	p.Font = Enum.Font.Gotham
+	p.TextSize = 12
+	p.TextXAlignment = Enum.TextXAlignment.Left
+	p.TextColor3 = Color3.fromRGB(200,200,200)
+	p.Text = string.format("player: %s | rate:%s | path: %s", e.player, tostring(e.rate), e.path)
+
+	local a = Instance.new("TextLabel", f)
+	a.BackgroundTransparency = 1
+	a.Position = UDim2.new(0,12,0,46)
+	a.Size = UDim2.new(1,-24,0,34)
+	a.Font = Enum.Font.Code
+	a.TextSize = 12
+	a.TextWrapped = true
+	a.TextXAlignment = Enum.TextXAlignment.Left
+	a.TextYAlignment = Enum.TextYAlignment.Top
+	a.TextColor3 = Color3.fromRGB(255,255,255)
+	a.Text = "args: " .. tostring(e.args or "")
+
+	f:SetAttribute("_q", norm(e.kind).." "..norm(e.remote).." "..norm(e.path).." "..norm(e.player).." "..norm(e.args))
+	return f
+end
+
+local function rebuild(logs)
+	for _, v in ipairs(cards) do
+		if v and v.Parent then v:Destroy() end
+	end
+	table.clear(cards)
+
+	for i = 1, #logs do
+		local e = logs[i]
+		local card = makeCard(e)
+		card.LayoutOrder = i
+		card.Parent = list
+		cards[#cards+1] = card
+	end
+end
+
+local function applyFilter()
+	local q = norm(search.Text)
+	for _, f in ipairs(cards) do
+		local hay = f:GetAttribute("_q") or ""
+		f.Visible = (q == "" or hay:find(q, 1, true) ~= nil)
+	end
+end
+
+search:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+
+btnRefresh.MouseButton1Click:Connect(function()
+	local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
+	if ok and typeof(logs) == "table" then
+		rebuild(logs)
+		applyFilter()
+	end
+end)
+
+btnClear.MouseButton1Click:Connect(function()
+	RE_CMD:FireServer("clear")
+	task.wait(0.1)
+	local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
+	if ok and typeof(logs) == "table" then
+		rebuild(logs)
+		applyFilter()
+	end
+end)
+
+-- live push
+RE_PUSH.OnClientEvent:Connect(function(e)
+	-- append
+	local card = makeCard(e)
+	card.LayoutOrder = (#cards + 1)
+	card.Parent = list
+	cards[#cards+1] = card
+	applyFilter()
+end)
+
+-- first load
+task.defer(function()
+	local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
+	if ok and typeof(logs) == "table" then
+		rebuild(logs)
+		applyFilter()
+	end
+end)
+]]
+
+--========================
+-- Wire server <-> client
+--========================
+RF_GET.OnServerInvoke = function(plr)
+	if not isAdmin(plr) then return {} end
+	return getAllLogs()
+end
+
+RE_CMD.OnServerEvent:Connect(function(plr, cmd)
+	if not isAdmin(plr) then return end
+	if cmd == "clear" then
+		table.clear(LOGS)
+		logHead = 0
+		logCount = 0
+		addLog({
+			kind="SYSTEM",
+			remote="(monitor)",
+			path="",
+			player=("%s (%d)"):format(plr.Name, plr.UserId),
+			args="logs cleared",
+			rate=0,
+			suspicious=false,
+			time=os.date("!%Y-%m-%d %H:%M:%S").."Z",
+		})
+	end
+end)
+
+-- inject UI for admins only
+Players.PlayerAdded:Connect(function(plr)
+	plr.CharacterAdded:Connect(function()
+		if not isAdmin(plr) then return end
+		local ps = plr:WaitForChild("PlayerScripts")
+		local ls = Instance.new("LocalScript")
+		ls.Name = "UFOX_RemoteMonitorClient"
+		ls.Source = CLIENT_UI_SOURCE
+		ls.Parent = ps
+	end)
+end)
+
+addLog({
+	kind="SYSTEM",
+	remote="(monitor)",
+	path="ServerScriptService",
+	player="server",
+	args="monitor started; remotes hooked",
+	rate=0,
+	suspicious=false,
+	time=os.date("!%Y-%m-%d %H:%M:%S").."Z",
+})
