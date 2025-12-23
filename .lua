@@ -1,505 +1,354 @@
---// ===== Exploit Remote Monitor + Admin UI (Roblox) =====
---// Paste as ONE script in ServerScriptService
---// What it does:
---// 1) Hooks RemoteEvents/RemoteFunctions callbacks to log who called + args
---// 2) Admin can open a live log UI (client) and filter/search
---// 3) Basic spam detection (rate) to highlight suspicious callers
---// Notes:
---// - You CANNOT see hacker "code", only the Remote name + arguments they sent.
---// - This helps you patch server-side validation on the specific remotes.
+--===== UFO HUB X • Home – Remote Monitor Launcher (Lazy Create + Auto Destroy) =====
+-- Adds:
+--  - Header: "Security"
+--  - Row: "Remote Monitor" with ▶ button
+-- Behavior:
+--  - Panel is CREATED only when opened
+--  - Panel is DESTROYED when closed (no leftovers)
+--  - Leaving game / LP removed => auto cleanup
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
+registerRight("Home", function(scroll)
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local TweenService = game:GetService("TweenService")
+    local LP = Players.LocalPlayer
 
---========================
--- CONFIG
---========================
-local ADMIN_USER_IDS = {
-	-- ใส่ UserId ของคุณ/ทีมงาน
-	-- ตัวอย่าง: [12345678] = true,
-}
--- ถ้าไม่ใส่เลย จะให้เจ้าของเกม (Creator) ดูได้อัตโนมัติ
-local ALLOW_CREATOR = true
+    -- ===== Theme (match your style) =====
+    local THEME = {
+        GREEN = Color3.fromRGB(25,255,125),
+        RED   = Color3.fromRGB(255,40,40),
+        WHITE = Color3.fromRGB(255,255,255),
+        GRAY  = Color3.fromRGB(200,200,200),
+        BLACK = Color3.fromRGB(0,0,0),
+        DARK  = Color3.fromRGB(10,10,10),
+    }
 
-local MAX_LOGS = 600          -- จำนวน log เก็บสูงสุด (ring buffer)
-local MAX_ARG_CHARS = 1400    -- จำกัดความยาว args ที่ serialize (กัน UI หน่วง/โดนปั่น)
-local RATE_WINDOW = 3         -- วินาที
-local RATE_LIMIT = 18         -- เรียกเกินนี้ใน window = ติดธง suspicious
+    local function corner(ui,r) local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 12); c.Parent=ui end
+    local function stroke(ui,t,col) local s=Instance.new("UIStroke"); s.Thickness=t or 2.2; s.Color=col or THEME.GREEN; s.Parent=ui end
+    local function tween(o,p,d) TweenService:Create(o,TweenInfo.new(d or 0.10,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),p):Play() end
 
---========================
--- Remote for admin UI
---========================
-local MON_FOLDER = ReplicatedStorage:FindFirstChild("_UFOX_MONITOR") or Instance.new("Folder")
-MON_FOLDER.Name = "_UFOX_MONITOR"
-MON_FOLDER.Parent = ReplicatedStorage
+    -- ===== cleanup only our nodes (header/row + old panel if any) =====
+    for _,n in ipairs({"SEC_Header","SEC_Row_RemoteMon","UFOX_RemoteMonPanel"}) do
+        local o = scroll:FindFirstChild(n)
+        if o then o:Destroy() end
+    end
 
-local RF_GET = MON_FOLDER:FindFirstChild("GetLogs") or Instance.new("RemoteFunction")
-RF_GET.Name = "GetLogs"
-RF_GET.Parent = MON_FOLDER
+    -- ===== ensure ONE list layout =====
+    local list = scroll:FindFirstChildOfClass("UIListLayout")
+    if not list then
+        list = Instance.new("UIListLayout", scroll)
+        list.Padding = UDim.new(0,12)
+        list.SortOrder = Enum.SortOrder.LayoutOrder
+    end
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 
-local RE_PUSH = MON_FOLDER:FindFirstChild("Push") or Instance.new("RemoteEvent")
-RE_PUSH.Name = "Push"
-RE_PUSH.Parent = MON_FOLDER
+    -- ===== dynamic base layout order (your baseline) =====
+    local base = 0
+    for _,c in ipairs(scroll:GetChildren()) do
+        if c:IsA("GuiObject") and c ~= list then
+            base = math.max(base, c.LayoutOrder or 0)
+        end
+    end
 
-local RE_CMD = MON_FOLDER:FindFirstChild("Cmd") or Instance.new("RemoteEvent")
-RE_CMD.Name = "Cmd"
-RE_CMD.Parent = MON_FOLDER
+    -- ===== header =====
+    local header = Instance.new("TextLabel")
+    header.Name = "SEC_Header"
+    header.Parent = scroll
+    header.Size = UDim2.new(1,0,0,36)
+    header.BackgroundTransparency = 1
+    header.Font = Enum.Font.GothamBold
+    header.TextSize = 16
+    header.TextColor3 = THEME.WHITE
+    header.TextXAlignment = Enum.TextXAlignment.Left
+    header.Text = "Security"
+    header.LayoutOrder = base + 1
 
---========================
--- Utilities
---========================
-local function isAdmin(plr: Player)
-	if ADMIN_USER_IDS[plr.UserId] then return true end
-	if ALLOW_CREATOR then
-		local creatorId = game.CreatorId
-		local creatorType = game.CreatorType
-		if creatorType == Enum.CreatorType.User and plr.UserId == creatorId then
-			return true
-		end
-	end
-	return false
-end
+    -- ===== Remote refs (server must create these) =====
+    local function getMonitorRemotes()
+        local MON = ReplicatedStorage:FindFirstChild("_UFOX_MONITOR")
+        if not MON then return nil end
+        local RF_GET = MON:FindFirstChild("GetLogs")
+        local RF_ISADMIN = MON:FindFirstChild("IsAdmin")
+        local RE_PUSH = MON:FindFirstChild("Push")
+        local RE_CMD = MON:FindFirstChild("Cmd")
+        return MON, RF_GET, RF_ISADMIN, RE_PUSH, RE_CMD
+    end
 
-local function safeToString(v, depth)
-	depth = depth or 0
-	if depth > 3 then return "<depth_limit>" end
+    local function isAdmin(RF_ISADMIN)
+        if not (RF_ISADMIN and RF_ISADMIN:IsA("RemoteFunction")) then return false end
+        local ok, v = pcall(function() return RF_ISADMIN:InvokeServer() end)
+        return ok and v == true
+    end
 
-	local t = typeof(v)
-	if t == "string" then
-		if #v > 220 then return v:sub(1, 220) .. "...(+)" end
-		return v
-	elseif t == "number" or t == "boolean" or t == "nil" then
-		return tostring(v)
-	elseif t == "Instance" then
-		return ("<%s:%s>"):format(v.ClassName, v.Name)
-	elseif t == "Vector3" or t == "CFrame" or t == "Color3" then
-		return tostring(v)
-	elseif t == "table" then
-		local out = {}
-		local n = 0
-		for k, val in pairs(v) do
-			n += 1
-			if n > 20 then
-				out[#out+1] = "...(+more)"
-				break
-			end
-			out[#out+1] = ("[%s]=%s"):format(safeToString(k, depth+1), safeToString(val, depth+1))
-		end
-		return "{ " .. table.concat(out, ", ") .. " }"
-	else
-		return ("<%s>"):format(t)
-	end
-end
+    -- ===== helpers =====
+    local function norm(s)
+        s = tostring(s or ""):lower()
+        s = s:gsub("%s+"," ")
+        return s
+    end
 
-local function packArgs(...)
-	local arr = table.pack(...)
-	local parts = {}
-	for i = 1, arr.n do
-		parts[#parts+1] = safeToString(arr[i], 0)
-	end
-	local s = table.concat(parts, " | ")
-	if #s > MAX_ARG_CHARS then
-		s = s:sub(1, MAX_ARG_CHARS) .. "...(trunc)"
-	end
-	return s
-end
+    -- ===== state =====
+    local panel -- created lazily
+    local cards = {}
+    local liveConn -- RE_PUSH connection
 
---========================
--- Ring Buffer Logs
---========================
-local LOGS = {}
-local logHead = 0
-local logCount = 0
-local logId = 0
+    local function destroyPanel()
+        if liveConn then
+            pcall(function() liveConn:Disconnect() end)
+            liveConn = nil
+        end
+        for _, v in ipairs(cards) do
+            if v and v.Parent then v:Destroy() end
+        end
+        table.clear(cards)
+        if panel and panel.Parent then panel:Destroy() end
+        panel = nil
+    end
 
-local function addLog(entry)
-	logId += 1
-	entry.id = logId
+    -- auto cleanup when leaving / LP removed
+    do
+        local ok = pcall(function()
+            LP.AncestryChanged:Connect(function(_, parent)
+                if parent == nil then
+                    destroyPanel()
+                end
+            end)
+        end)
+    end
 
-	logHead = (logHead % MAX_LOGS) + 1
-	LOGS[logHead] = entry
-	logCount = math.min(logCount + 1, MAX_LOGS)
+    -- ===== create panel lazily =====
+    local function createPanel(MON, RF_GET, RE_PUSH, RE_CMD)
+        if panel and panel.Parent then return panel end
 
-	-- push to admins live
-	RE_PUSH:FireAllClients(entry)
-end
+        panel = Instance.new("Frame")
+        panel.Name = "UFOX_RemoteMonPanel"
+        panel.Parent = scroll
+        panel.Size = UDim2.new(1,-6,0,360)
+        panel.BackgroundColor3 = THEME.DARK
+        panel.BorderSizePixel = 0
+        corner(panel, 12)
+        stroke(panel, 2.2, THEME.GREEN)
+        panel.LayoutOrder = base + 3
 
-local function getAllLogs()
-	local out = {}
-	-- oldest -> newest
-	local start = (logHead - logCount + 1)
-	for i = 0, logCount - 1 do
-		local idx = ((start + i - 1) % MAX_LOGS) + 1
-		out[#out+1] = LOGS[idx]
-	end
-	return out
-end
+        local top = Instance.new("Frame", panel)
+        top.BackgroundTransparency = 1
+        top.Size = UDim2.new(1,0,0,38)
 
---========================
--- Rate tracking (suspicious)
---========================
-local RATE = {} -- [userId][key] = {t0, count}
-local function bumpRate(userId, key)
-	local now = os.clock()
-	RATE[userId] = RATE[userId] or {}
-	local r = RATE[userId][key]
-	if not r then
-		r = { t0 = now, count = 0 }
-		RATE[userId][key] = r
-	end
-	if (now - r.t0) > RATE_WINDOW then
-		r.t0 = now
-		r.count = 0
-	end
-	r.count += 1
-	return r.count
-end
+        local title = Instance.new("TextLabel", top)
+        title.BackgroundTransparency = 1
+        title.Position = UDim2.new(0,12,0,0)
+        title.Size = UDim2.new(1,-24,1,0)
+        title.Font = Enum.Font.GothamBold
+        title.TextSize = 15
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.TextColor3 = THEME.WHITE
+        title.Text = "Remote Monitor"
 
---========================
--- Hooking Remotes
---========================
-local function hookRemoteEvent(re: RemoteEvent, path: string)
-	if re:GetAttribute("__UFOX_HOOKED") then return end
-	re:SetAttribute("__UFOX_HOOKED", true)
+        local search = Instance.new("TextBox", panel)
+        search.Position = UDim2.new(0,12,0,44)
+        search.Size = UDim2.new(1,-24,0,30)
+        search.PlaceholderText = "ค้นหา: player / remote / args / path"
+        search.Text = ""
+        search.ClearTextOnFocus = false
+        search.Font = Enum.Font.Gotham
+        search.TextSize = 13
+        search.TextColor3 = THEME.WHITE
+        search.BackgroundColor3 = THEME.BLACK
+        corner(search, 10)
+        stroke(search, 1.6, THEME.GREEN)
 
-	local old = re.OnServerEvent
-	re.OnServerEvent = function(plr: Player, ...)
-		local args = packArgs(...)
-		local rateKey = ("RE:%s"):format(path)
-		local c = bumpRate(plr.UserId, rateKey)
+        local btnClear = Instance.new("TextButton", panel)
+        btnClear.Position = UDim2.new(0,12,1,-38)
+        btnClear.Size = UDim2.fromOffset(120,28)
+        btnClear.Text = "Clear"
+        btnClear.Font = Enum.Font.GothamBold
+        btnClear.TextSize = 13
+        btnClear.TextColor3 = THEME.WHITE
+        btnClear.BackgroundColor3 = THEME.BLACK
+        btnClear.AutoButtonColor = false
+        corner(btnClear, 10)
+        stroke(btnClear, 1.6, THEME.RED)
 
-		addLog({
-			kind = "RemoteEvent",
-			remote = re.Name,
-			path = path,
-			player = ("%s (%d)"):format(plr.Name, plr.UserId),
-			args = args,
-			rate = c,
-			suspicious = (c >= RATE_LIMIT),
-			time = os.date("!%Y-%m-%d %H:%M:%S") .. "Z",
-		})
+        local btnRefresh = Instance.new("TextButton", panel)
+        btnRefresh.Position = UDim2.new(0,140,1,-38)
+        btnRefresh.Size = UDim2.fromOffset(120,28)
+        btnRefresh.Text = "Refresh"
+        btnRefresh.Font = Enum.Font.GothamBold
+        btnRefresh.TextSize = 13
+        btnRefresh.TextColor3 = THEME.WHITE
+        btnRefresh.BackgroundColor3 = THEME.BLACK
+        btnRefresh.AutoButtonColor = false
+        corner(btnRefresh, 10)
+        stroke(btnRefresh, 1.6, THEME.GREEN)
 
-		if typeof(old) == "function" then
-			return old(plr, ...)
-		end
-	end
-end
+        local listFrame = Instance.new("ScrollingFrame", panel)
+        listFrame.Position = UDim2.new(0,12,0,82)
+        listFrame.Size = UDim2.new(1,-24,1,-126)
+        listFrame.BackgroundTransparency = 1
+        listFrame.ScrollBarThickness = 6
+        listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        listFrame.CanvasSize = UDim2.new(0,0,0,0)
 
-local function hookRemoteFunction(rf: RemoteFunction, path: string)
-	if rf:GetAttribute("__UFOX_HOOKED") then return end
-	rf:SetAttribute("__UFOX_HOOKED", true)
+        local lay = Instance.new("UIListLayout", listFrame)
+        lay.Padding = UDim.new(0,8)
+        lay.SortOrder = Enum.SortOrder.LayoutOrder
 
-	local old = rf.OnServerInvoke
-	rf.OnServerInvoke = function(plr: Player, ...)
-		local args = packArgs(...)
-		local rateKey = ("RF:%s"):format(path)
-		local c = bumpRate(plr.UserId, rateKey)
+        local function makeCard(e)
+            local f = Instance.new("Frame")
+            f.Size = UDim2.new(1,0,0,92)
+            f.BackgroundColor3 = THEME.BLACK
+            f.BorderSizePixel = 0
+            corner(f,12)
 
-		addLog({
-			kind = "RemoteFunction",
-			remote = rf.Name,
-			path = path,
-			player = ("%s (%d)"):format(plr.Name, plr.UserId),
-			args = args,
-			rate = c,
-			suspicious = (c >= RATE_LIMIT),
-			time = os.date("!%Y-%m-%d %H:%M:%S") .. "Z",
-		})
+            local st = Instance.new("UIStroke", f)
+            st.Thickness = 1.6
+            st.Color = (e.suspicious and THEME.RED) or THEME.GREEN
 
-		if typeof(old) == "function" then
-			return old(plr, ...)
-		end
-		-- default: nil
-		return nil
-	end
-end
+            local t = Instance.new("TextLabel", f)
+            t.BackgroundTransparency = 1
+            t.Position = UDim2.new(0,12,0,8)
+            t.Size = UDim2.new(1,-24,0,18)
+            t.Font = Enum.Font.GothamBold
+            t.TextSize = 13
+            t.TextXAlignment = Enum.TextXAlignment.Left
+            t.TextColor3 = THEME.WHITE
+            t.Text = string.format("[%s] %s • %s", e.kind or "?", e.remote or "?", e.time or "?")
 
-local function fullPath(inst: Instance)
-	local parts = {}
-	local cur = inst
-	while cur and cur ~= game do
-		parts[#parts+1] = cur.Name
-		cur = cur.Parent
-	end
-	table.reverse(parts)
-	return table.concat(parts, ".")
-end
+            local p = Instance.new("TextLabel", f)
+            p.BackgroundTransparency = 1
+            p.Position = UDim2.new(0,12,0,28)
+            p.Size = UDim2.new(1,-24,0,18)
+            p.Font = Enum.Font.Gotham
+            p.TextSize = 12
+            p.TextXAlignment = Enum.TextXAlignment.Left
+            p.TextColor3 = THEME.GRAY
+            p.Text = string.format("player: %s | rate:%s | path: %s", e.player or "?", tostring(e.rate or 0), e.path or "?")
 
-local function scanAndHook(root: Instance)
-	for _, d in ipairs(root:GetDescendants()) do
-		if d:IsA("RemoteEvent") then
-			hookRemoteEvent(d, fullPath(d))
-		elseif d:IsA("RemoteFunction") then
-			hookRemoteFunction(d, fullPath(d))
-		end
-	end
-end
+            local a = Instance.new("TextLabel", f)
+            a.BackgroundTransparency = 1
+            a.Position = UDim2.new(0,12,0,48)
+            a.Size = UDim2.new(1,-24,0,40)
+            a.Font = Enum.Font.Code
+            a.TextSize = 12
+            a.TextWrapped = true
+            a.TextXAlignment = Enum.TextXAlignment.Left
+            a.TextYAlignment = Enum.TextYAlignment.Top
+            a.TextColor3 = THEME.WHITE
+            a.Text = "args: " .. tostring(e.args or "")
 
--- initial scan
-scanAndHook(game)
+            f:SetAttribute("_q", norm(e.kind).." "..norm(e.remote).." "..norm(e.path).." "..norm(e.player).." "..norm(e.args))
+            return f
+        end
 
--- hook newly added remotes
-game.DescendantAdded:Connect(function(d)
-	if d:IsA("RemoteEvent") then
-		hookRemoteEvent(d, fullPath(d))
-	elseif d:IsA("RemoteFunction") then
-		hookRemoteFunction(d, fullPath(d))
-	end
+        local function rebuild(logs)
+            for _, v in ipairs(cards) do
+                if v and v.Parent then v:Destroy() end
+            end
+            table.clear(cards)
+
+            for i = 1, #logs do
+                local e = logs[i]
+                local card = makeCard(e)
+                card.LayoutOrder = i
+                card.Parent = listFrame
+                cards[#cards+1] = card
+            end
+        end
+
+        local function applyFilter()
+            local q = norm(search.Text)
+            for _, f in ipairs(cards) do
+                local hay = f:GetAttribute("_q") or ""
+                f.Visible = (q == "" or hay:find(q, 1, true) ~= nil)
+            end
+        end
+        search:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+
+        local function refreshLogs()
+            if not (RF_GET and RF_GET:IsA("RemoteFunction")) then return end
+            local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
+            if ok and typeof(logs) == "table" then
+                rebuild(logs)
+                applyFilter()
+            end
+        end
+
+        btnRefresh.MouseButton1Click:Connect(refreshLogs)
+
+        btnClear.MouseButton1Click:Connect(function()
+            if RE_CMD and RE_CMD:IsA("RemoteEvent") then
+                RE_CMD:FireServer("clear")
+            end
+            task.wait(0.1)
+            refreshLogs()
+        end)
+
+        -- live push (only while panel exists)
+        if RE_PUSH and RE_PUSH:IsA("RemoteEvent") then
+            liveConn = RE_PUSH.OnClientEvent:Connect(function(e)
+                if not (panel and panel.Parent) then return end
+                local card = makeCard(e)
+                card.LayoutOrder = (#cards + 1)
+                card.Parent = listFrame
+                cards[#cards+1] = card
+                applyFilter()
+            end)
+        end
+
+        -- initial load
+        task.defer(refreshLogs)
+
+        return panel
+    end
+
+    -- ===== Row button (▶) =====
+    local row = Instance.new("Frame")
+    row.Name = "SEC_Row_RemoteMon"
+    row.Parent = scroll
+    row.Size = UDim2.new(1,-6,0,46)
+    row.BackgroundColor3 = THEME.BLACK
+    corner(row,12)
+    stroke(row,2.2,THEME.GREEN)
+    row.LayoutOrder = base + 2
+
+    local lab = Instance.new("TextLabel", row)
+    lab.BackgroundTransparency = 1
+    lab.Position = UDim2.new(0,16,0,0)
+    lab.Size = UDim2.new(1,-160,1,0)
+    lab.Font = Enum.Font.GothamBold
+    lab.TextSize = 13
+    lab.TextColor3 = THEME.WHITE
+    lab.TextXAlignment = Enum.TextXAlignment.Left
+    lab.Text = "Remote Monitor"
+
+    local btn = Instance.new("TextButton", row)
+    btn.AnchorPoint = Vector2.new(1,0.5)
+    btn.Position = UDim2.new(1,-14,0.5,0)
+    btn.Size = UDim2.fromOffset(26,26)
+    btn.BackgroundTransparency = 1
+    btn.Text = "▶"
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 18
+    btn.TextColor3 = THEME.WHITE
+    btn.AutoButtonColor = false
+
+    btn.MouseButton1Click:Connect(function()
+        local MON, RF_GET, RF_ISADMIN, RE_PUSH, RE_CMD = getMonitorRemotes()
+        if not MON then
+            warn("[UFOX] _UFOX_MONITOR not found (server monitor not running).")
+            return
+        end
+        if not isAdmin(RF_ISADMIN) then
+            warn("[UFOX] Not admin for Remote Monitor.")
+            return
+        end
+
+        if panel and panel.Parent then
+            -- close = destroy (no leftovers)
+            destroyPanel()
+        else
+            -- open = create
+            createPanel(MON, RF_GET, RE_PUSH, RE_CMD)
+        end
+    end)
 end)
-
---========================
--- Admin UI injection (client)
---========================
-local CLIENT_UI_SOURCE = [[
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local LP = Players.LocalPlayer
-
-local F = ReplicatedStorage:WaitForChild("_UFOX_MONITOR")
-local RF_GET = F:WaitForChild("GetLogs")
-local RE_PUSH = F:WaitForChild("Push")
-local RE_CMD = F:WaitForChild("Cmd")
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "UFOX_RemoteMonitor"
-gui.ResetOnSpawn = false
-gui.Parent = LP:WaitForChild("PlayerGui")
-
-local main = Instance.new("Frame")
-main.Parent = gui
-main.Size = UDim2.fromOffset(640, 360)
-main.Position = UDim2.new(1, -660, 1, -390)
-main.BackgroundColor3 = Color3.fromRGB(10,10,10)
-main.BorderSizePixel = 0
-
-local uic = Instance.new("UICorner", main); uic.CornerRadius = UDim.new(0, 12)
-local st = Instance.new("UIStroke", main); st.Thickness = 2; st.Color = Color3.fromRGB(25,255,125)
-
-local top = Instance.new("Frame", main)
-top.Size = UDim2.new(1,0,0,42)
-top.BackgroundTransparency = 1
-
-local title = Instance.new("TextLabel", top)
-title.BackgroundTransparency = 1
-title.Position = UDim2.new(0,12,0,0)
-title.Size = UDim2.new(1,-24,1,0)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 16
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(255,255,255)
-title.Text = "Remote Monitor (Server Logs)"
-
-local search = Instance.new("TextBox", main)
-search.Position = UDim2.new(0,12,0,48)
-search.Size = UDim2.new(1,-24,0,30)
-search.PlaceholderText = "ค้นหา: player / remote / args / path"
-search.Text = ""
-search.ClearTextOnFocus = false
-search.Font = Enum.Font.Gotham
-search.TextSize = 14
-search.TextColor3 = Color3.fromRGB(255,255,255)
-search.BackgroundColor3 = Color3.fromRGB(0,0,0)
-local sc = Instance.new("UICorner", search); sc.CornerRadius = UDim.new(0,10)
-local ss = Instance.new("UIStroke", search); ss.Thickness = 1.6; ss.Color = Color3.fromRGB(25,255,125)
-
-local btnClear = Instance.new("TextButton", main)
-btnClear.Position = UDim2.new(0,12,1,-38)
-btnClear.Size = UDim2.fromOffset(120,28)
-btnClear.Text = "Clear"
-btnClear.Font = Enum.Font.GothamBold
-btnClear.TextSize = 14
-btnClear.TextColor3 = Color3.fromRGB(255,255,255)
-btnClear.BackgroundColor3 = Color3.fromRGB(0,0,0)
-btnClear.AutoButtonColor = false
-local bc = Instance.new("UICorner", btnClear); bc.CornerRadius = UDim.new(0,10)
-local bs = Instance.new("UIStroke", btnClear); bs.Thickness = 1.6; bs.Color = Color3.fromRGB(255,40,40)
-
-local btnRefresh = Instance.new("TextButton", main)
-btnRefresh.Position = UDim2.new(0,140,1,-38)
-btnRefresh.Size = UDim2.fromOffset(120,28)
-btnRefresh.Text = "Refresh"
-btnRefresh.Font = Enum.Font.GothamBold
-btnRefresh.TextSize = 14
-btnRefresh.TextColor3 = Color3.fromRGB(255,255,255)
-btnRefresh.BackgroundColor3 = Color3.fromRGB(0,0,0)
-btnRefresh.AutoButtonColor = false
-local rc = Instance.new("UICorner", btnRefresh); rc.CornerRadius = UDim.new(0,10)
-local rs = Instance.new("UIStroke", btnRefresh); rs.Thickness = 1.6; rs.Color = Color3.fromRGB(25,255,125)
-
-local list = Instance.new("ScrollingFrame", main)
-list.Position = UDim2.new(0,12,0,86)
-list.Size = UDim2.new(1,-24,1,-136)
-list.BackgroundTransparency = 1
-list.ScrollBarThickness = 6
-list.CanvasSize = UDim2.new(0,0,0,0)
-list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-
-local lay = Instance.new("UIListLayout", list)
-lay.Padding = UDim.new(0,8)
-lay.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function norm(s)
-	s = tostring(s or ""):lower()
-	s = s:gsub("%s+"," ")
-	return s
-end
-
-local cards = {}
-local function makeCard(e)
-	local f = Instance.new("Frame")
-	f.Size = UDim2.new(1,0,0,86)
-	f.BackgroundColor3 = Color3.fromRGB(0,0,0)
-	f.BorderSizePixel = 0
-	local c = Instance.new("UICorner", f); c.CornerRadius = UDim.new(0,12)
-	local s = Instance.new("UIStroke", f); s.Thickness = 1.6
-	s.Color = e.suspicious and Color3.fromRGB(255,40,40) or Color3.fromRGB(25,255,125)
-
-	local t = Instance.new("TextLabel", f)
-	t.BackgroundTransparency = 1
-	t.Position = UDim2.new(0,12,0,8)
-	t.Size = UDim2.new(1,-24,0,18)
-	t.Font = Enum.Font.GothamBold
-	t.TextSize = 13
-	t.TextXAlignment = Enum.TextXAlignment.Left
-	t.TextColor3 = Color3.fromRGB(255,255,255)
-	t.Text = string.format("[%s] %s • %s", e.kind, e.remote, e.time)
-
-	local p = Instance.new("TextLabel", f)
-	p.BackgroundTransparency = 1
-	p.Position = UDim2.new(0,12,0,28)
-	p.Size = UDim2.new(1,-24,0,18)
-	p.Font = Enum.Font.Gotham
-	p.TextSize = 12
-	p.TextXAlignment = Enum.TextXAlignment.Left
-	p.TextColor3 = Color3.fromRGB(200,200,200)
-	p.Text = string.format("player: %s | rate:%s | path: %s", e.player, tostring(e.rate), e.path)
-
-	local a = Instance.new("TextLabel", f)
-	a.BackgroundTransparency = 1
-	a.Position = UDim2.new(0,12,0,46)
-	a.Size = UDim2.new(1,-24,0,34)
-	a.Font = Enum.Font.Code
-	a.TextSize = 12
-	a.TextWrapped = true
-	a.TextXAlignment = Enum.TextXAlignment.Left
-	a.TextYAlignment = Enum.TextYAlignment.Top
-	a.TextColor3 = Color3.fromRGB(255,255,255)
-	a.Text = "args: " .. tostring(e.args or "")
-
-	f:SetAttribute("_q", norm(e.kind).." "..norm(e.remote).." "..norm(e.path).." "..norm(e.player).." "..norm(e.args))
-	return f
-end
-
-local function rebuild(logs)
-	for _, v in ipairs(cards) do
-		if v and v.Parent then v:Destroy() end
-	end
-	table.clear(cards)
-
-	for i = 1, #logs do
-		local e = logs[i]
-		local card = makeCard(e)
-		card.LayoutOrder = i
-		card.Parent = list
-		cards[#cards+1] = card
-	end
-end
-
-local function applyFilter()
-	local q = norm(search.Text)
-	for _, f in ipairs(cards) do
-		local hay = f:GetAttribute("_q") or ""
-		f.Visible = (q == "" or hay:find(q, 1, true) ~= nil)
-	end
-end
-
-search:GetPropertyChangedSignal("Text"):Connect(applyFilter)
-
-btnRefresh.MouseButton1Click:Connect(function()
-	local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
-	if ok and typeof(logs) == "table" then
-		rebuild(logs)
-		applyFilter()
-	end
-end)
-
-btnClear.MouseButton1Click:Connect(function()
-	RE_CMD:FireServer("clear")
-	task.wait(0.1)
-	local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
-	if ok and typeof(logs) == "table" then
-		rebuild(logs)
-		applyFilter()
-	end
-end)
-
--- live push
-RE_PUSH.OnClientEvent:Connect(function(e)
-	-- append
-	local card = makeCard(e)
-	card.LayoutOrder = (#cards + 1)
-	card.Parent = list
-	cards[#cards+1] = card
-	applyFilter()
-end)
-
--- first load
-task.defer(function()
-	local ok, logs = pcall(function() return RF_GET:InvokeServer() end)
-	if ok and typeof(logs) == "table" then
-		rebuild(logs)
-		applyFilter()
-	end
-end)
-]]
-
---========================
--- Wire server <-> client
---========================
-RF_GET.OnServerInvoke = function(plr)
-	if not isAdmin(plr) then return {} end
-	return getAllLogs()
-end
-
-RE_CMD.OnServerEvent:Connect(function(plr, cmd)
-	if not isAdmin(plr) then return end
-	if cmd == "clear" then
-		table.clear(LOGS)
-		logHead = 0
-		logCount = 0
-		addLog({
-			kind="SYSTEM",
-			remote="(monitor)",
-			path="",
-			player=("%s (%d)"):format(plr.Name, plr.UserId),
-			args="logs cleared",
-			rate=0,
-			suspicious=false,
-			time=os.date("!%Y-%m-%d %H:%M:%S").."Z",
-		})
-	end
-end)
-
--- inject UI for admins only
-Players.PlayerAdded:Connect(function(plr)
-	plr.CharacterAdded:Connect(function()
-		if not isAdmin(plr) then return end
-		local ps = plr:WaitForChild("PlayerScripts")
-		local ls = Instance.new("LocalScript")
-		ls.Name = "UFOX_RemoteMonitorClient"
-		ls.Source = CLIENT_UI_SOURCE
-		ls.Parent = ps
-	end)
-end)
-
-addLog({
-	kind="SYSTEM",
-	remote="(monitor)",
-	path="ServerScriptService",
-	player="server",
-	args="monitor started; remotes hooked",
-	rate=0,
-	suspicious=false,
-	time=os.date("!%Y-%m-%d %H:%M:%S").."Z",
-})
